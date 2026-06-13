@@ -1,4 +1,4 @@
-# PELLM - AI Database Query Assistant
+# QueryStream - Zero-Knowledge Natural Language Database Agent
 
 This is a full-stack project built with React (Vite) and Python (FastAPI). It allows users to connect to their databases (PostgreSQL, MySQL, MongoDB), either locally or in the cloud, and query them using natural language.
 
