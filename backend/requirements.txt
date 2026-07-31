@@ -1,9 +1,20 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pydantic
+pydantic-settings
 google-genai
-sqlalchemy
-psycopg2-binary
-pymysql
-pymongo
+# Async SQL layer
+sqlalchemy[asyncio]
+asyncpg
+aiomysql
+# Async MongoDB
+motor
+# Session management
+redis[asyncio]
+# LLM orchestration
+langgraph
+# Utilities
 python-dotenv
+# Testing
+pytest
+pytest-asyncio

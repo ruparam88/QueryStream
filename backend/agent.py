@@ -1,244 +1,250 @@
-import os
-from sqlalchemy import create_engine, text
-from pymongo import MongoClient
+"""
+QueryStream agent — async, stateless per-request coordinator.
+
+v5: uses central config (config.py) — no scattered os.environ.get calls.
+
+Lifecycle per request:
+  1. RedisSessionManager.load(session_id)       → session dict
+  2. ChatManager(session_data, redis, sid)      → populate self.*
+  3. await manager.process_message(msg)
+       CONNECTED state:
+         a. SemanticCache.lookup(msg)           → HIT → execute cached
+         b. MISS → run_query_graph_async()
+         c. SemanticCache.store(msg, _parsed)   → persist on success
+  4. RedisSessionManager.save(session_id, ...)  → Redis
+"""
+
+import logging
+
 from google import genai
-from dotenv import load_dotenv
 
-load_dotenv(override=True)
+from config import settings
+from db.connections import make_async_sql_engine, make_motor_client
+from db.repository import SQLRepository, MongoRepository
+from graph import run_query_graph_async
+from cache.semantic_cache import SemanticCache
 
-# Set your Gemini API Key here or in environment variables
-# For now, we will assume it's in the environment variable GEMINI_API_KEY
-# If not set, it will mock the LLM response for demonstration purposes
+logger = logging.getLogger(__name__)
+
 
 class ChatManager:
-    def __init__(self):
-        self.state = 'AWAITING_DB_TYPE'
-        self.db_type = None
-        self.hosting_type = None
-        self.uri = None
-        self.engine = None
-        self.mongo_client = None
-        self.mongo_db = None
-        
-        self.api_key = os.environ.get("GEMINI_API_KEY")
-        if self.api_key:
-            self.client = genai.Client(api_key=self.api_key)
-        else:
-            self.client = None
+    """
+    Per-request coordinator. Holds session state loaded from Redis.
+    Accepts an optional redis_client for semantic cache operations.
+    Call to_dict() after process_message() to persist back to Redis.
+    """
 
-    def process_message(self, message: str) -> dict:
-        if self.state == 'AWAITING_DB_TYPE':
-            return self._handle_db_type(message)
-        elif self.state == 'AWAITING_HOSTING_TYPE':
-            return self._handle_hosting_type(message)
-        elif self.state == 'AWAITING_URI':
-            return self._handle_uri(message)
-        elif self.state == 'CONNECTED':
-            return self._handle_query(message)
-        else:
-            return {"reply": "Unknown state. Let's restart. What database type?", "options": ['PostgreSQL', 'MySQL', 'MongoDB'], "state": 'AWAITING_DB_TYPE'}
+    def __init__(
+        self,
+        session_data: dict,
+        redis_client=None,
+        session_id: str = "",
+    ) -> None:
+        self.state        = session_data.get("conv_state", "AWAITING_DB_TYPE")
+        self.db_type      = session_data.get("db_type")
+        self.hosting_type = session_data.get("hosting_type")
+        self.uri          = session_data.get("uri")
 
-    def _handle_db_type(self, message: str) -> dict:
-        db_type = message.lower().strip()
-        if 'postgres' in db_type:
-            self.db_type = 'PostgreSQL'
-        elif 'mysql' in db_type or 'sql' in db_type:
-            self.db_type = 'MySQL'
-        elif 'mongo' in db_type:
-            self.db_type = 'MongoDB'
-        else:
-            return {
-                "reply": "I didn't recognize that database type. Please choose from PostgreSQL, MySQL, or MongoDB.",
-                "options": ['PostgreSQL', 'MySQL', 'MongoDB'],
-                "state": self.state
-            }
-        
-        self.state = 'AWAITING_HOSTING_TYPE'
+        self._redis      = redis_client
+        self._session_id = session_id
+
+        self.genai_client = (
+            genai.Client(api_key=settings.gemini_api_key)
+            if settings.gemini_api_key else None
+        )
+
+    def to_dict(self) -> dict:
+        """Serialisable snapshot for Redis storage."""
         return {
-            "reply": f"Great! You selected {self.db_type}. Is this database hosted locally or in the cloud?",
-            "options": ['Local', 'Cloud'],
-            "state": self.state
+            "conv_state":   self.state,
+            "db_type":      self.db_type,
+            "hosting_type": self.hosting_type,
+            "uri":          self.uri,
         }
 
-    def _handle_hosting_type(self, message: str) -> dict:
-        hosting = message.lower().strip()
-        if 'local' in hosting:
-            self.hosting_type = 'Local'
-        elif 'cloud' in hosting:
-            self.hosting_type = 'Cloud'
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    async def process_message(self, message: str) -> dict:
+        dispatch = {
+            "AWAITING_DB_TYPE":      self._handle_db_type,
+            "AWAITING_HOSTING_TYPE": self._handle_hosting_type,
+            "AWAITING_URI":          self._handle_uri,
+            "CONNECTED":             self._handle_query,
+        }
+        handler = dispatch.get(self.state)
+        if handler:
+            return await handler(message)
+        self.state = "AWAITING_DB_TYPE"
+        return {
+            "reply": "Unexpected state. Let's restart — what database type?",
+            "options": ["PostgreSQL", "MySQL", "MongoDB"],
+            "state": self.state,
+        }
+
+    # ------------------------------------------------------------------
+    # Conversation state handlers
+    # ------------------------------------------------------------------
+
+    async def _handle_db_type(self, message: str) -> dict:
+        msg = message.lower().strip()
+        if "postgres" in msg:
+            self.db_type = "PostgreSQL"
+        elif "mysql" in msg or "sql" in msg:
+            self.db_type = "MySQL"
+        elif "mongo" in msg:
+            self.db_type = "MongoDB"
+        else:
+            return {
+                "reply": "I didn't recognise that. Please choose from PostgreSQL, MySQL, or MongoDB.",
+                "options": ["PostgreSQL", "MySQL", "MongoDB"],
+                "state": self.state,
+            }
+        self.state = "AWAITING_HOSTING_TYPE"
+        return {
+            "reply": f"Great! You selected {self.db_type}. Is this database hosted locally or in the cloud?",
+            "options": ["Local", "Cloud"],
+            "state": self.state,
+        }
+
+    async def _handle_hosting_type(self, message: str) -> dict:
+        msg = message.lower().strip()
+        if "local" in msg:
+            self.hosting_type = "Local"
+        elif "cloud" in msg:
+            self.hosting_type = "Cloud"
         else:
             return {
                 "reply": "Please select either Local or Cloud.",
-                "options": ['Local', 'Cloud'],
-                "state": self.state
+                "options": ["Local", "Cloud"],
+                "state": self.state,
             }
-            
-        self.state = 'AWAITING_URI'
-        example_uri = ""
-        if self.db_type == 'PostgreSQL':
-            example_uri = "postgresql://user:password@localhost:5432/dbname" if self.hosting_type == 'Local' else "postgresql://user:password@cloud-host:5432/dbname"
-        elif self.db_type == 'MySQL':
-            example_uri = "mysql+pymysql://user:password@localhost:3306/dbname" if self.hosting_type == 'Local' else "mysql+pymysql://user:password@cloud-host:3306/dbname"
-        elif self.db_type == 'MongoDB':
-            example_uri = "mongodb://localhost:27017/" if self.hosting_type == 'Local' else "mongodb+srv://user:password@cluster.mongodb.net/"
-            
+
+        examples = {
+            ("PostgreSQL", "Local"):  "postgresql://user:password@localhost:5432/dbname",
+            ("PostgreSQL", "Cloud"):  "postgresql://user:password@cloud-host:5432/dbname",
+            ("MySQL", "Local"):       "mysql://user:password@localhost:3306/dbname",
+            ("MySQL", "Cloud"):       "mysql://user:password@cloud-host:3306/dbname",
+            ("MongoDB", "Local"):     "mongodb://localhost:27017/",
+            ("MongoDB", "Cloud"):     "mongodb+srv://user:password@cluster.mongodb.net/",
+        }
+        self.state = "AWAITING_URI"
         return {
-            "reply": f"Understood. Please provide the connection URI/URL for your {self.hosting_type} {self.db_type} database.\nExample: `{example_uri}`",
-            "state": self.state
+            "reply": (
+                f"Understood. Please provide the connection URI for your "
+                f"{self.hosting_type} {self.db_type} database.\n"
+                f"Example: `{examples.get((self.db_type, self.hosting_type), '')}`"
+            ),
+            "state": self.state,
         }
 
-    def _handle_uri(self, message: str) -> dict:
+    async def _handle_uri(self, message: str) -> dict:
         self.uri = message.strip()
-        
-        # Automatically fix mysql:// to mysql+pymysql://
-        if self.db_type == 'MySQL' and self.uri.startswith('mysql://'):
-            self.uri = self.uri.replace('mysql://', 'mysql+pymysql://', 1)
-            
+
         try:
-            if self.db_type in ['PostgreSQL', 'MySQL']:
-                self.engine = create_engine(self.uri)
-                # Test connection
-                with self.engine.connect() as conn:
-                    pass
-            elif self.db_type == 'MongoDB':
-                self.mongo_client = MongoClient(self.uri, serverSelectionTimeoutMS=5000)
-                # Test connection
-                self.mongo_client.server_info()
-                # Try to get default db
-                db_name = self.uri.split('/')[-1].split('?')[0]
-                if not db_name:
-                    db_name = 'test'
-                self.mongo_db = self.mongo_client[db_name]
-                
-            self.state = 'CONNECTED'
+            if self.db_type in ("PostgreSQL", "MySQL"):
+                engine = make_async_sql_engine(self.db_type, self.uri)
+                repo = SQLRepository(engine)
+                await repo.ping()
+                await engine.dispose()
+            else:
+                client = make_motor_client(self.uri)
+                db_name = self.uri.split("/")[-1].split("?")[0] or "test"
+                repo = MongoRepository(client[db_name])
+                await repo.ping()
+                client.close()
+
+            self.state = "CONNECTED"
+            logger.info("DB connected: type=%s hosting=%s", self.db_type, self.hosting_type)
             return {
                 "reply": f"Successfully connected to the {self.db_type} database! What would you like to query?",
                 "state": self.state,
-                "db_type": self.db_type
-            }
-        except Exception as e:
-            return {
-                "reply": f"Failed to connect. Error: {str(e)}\nPlease check your URI and try again.",
-                "state": self.state
+                "db_type": self.db_type,
             }
 
-    def _generate_sql_query(self, natural_query: str) -> str:
-        if not self.client:
-            raise ValueError("No API Key found! Please set GEMINI_API_KEY environment variable and restart the server.")
-            
-        prompt = f"""
-        Translate the following natural language query into a valid SQL query for a {self.db_type} database.
-        Return ONLY the raw SQL query, without markdown blocks, without explanations.
-        Query: {natural_query}
-        """
-        response = self.client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        query = response.text.strip()
-        if query.startswith('```sql'):
-            query = query[6:]
-        if query.startswith('```'):
-            query = query[3:]
-        if query.endswith('```'):
-            query = query[:-3]
-            
-        return query.strip()
-
-    def _generate_mongo_query(self, natural_query: str) -> dict:
-        if not self.client:
-            raise ValueError("No API Key found! Please set GEMINI_API_KEY environment variable and restart the server.")
-            
-        prompt = f"""
-        Translate the following natural language query into a MongoDB query.
-        Return a JSON object with two keys:
-        - "collection": the name of the collection
-        - "filter": the JSON filter object for the find() method.
-        Do not wrap in markdown blocks, return ONLY valid JSON.
-        Query: {natural_query}
-        """
-        response = self.client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=prompt,
-        )
-        import json
-        text_resp = response.text.strip()
-        if text_resp.startswith('```json'):
-            text_resp = text_resp[7:]
-        if text_resp.startswith('```'):
-            text_resp = text_resp[3:]
-        if text_resp.endswith('```'):
-            text_resp = text_resp[:-3]
-        
-        try:
-            return json.loads(text_resp.strip())
-        except:
-            return {"collection": "unknown", "query": {}}
-
-    def _handle_query(self, message: str) -> dict:
-        try:
-            if self.db_type in ['PostgreSQL', 'MySQL']:
-                sql_query = self._generate_sql_query(message)
-                
-                # Execute query
-                # Note: In a production app, we MUST validate and sanitize this query to prevent destructive operations.
-                with self.engine.connect() as conn:
-                    result = conn.execute(text(sql_query))
-                    if not result.returns_rows:
-                        conn.commit()
-                        return {
-                            "reply": "Query executed successfully.",
-                            "query": sql_query,
-                            "state": self.state,
-                            "db_type": self.db_type
-                        }
-                    else:
-                        columns = result.keys()
-                        rows = result.fetchmany(10)
-                        data = [dict(zip(columns, row)) for row in rows]
-                        return {
-                            "reply": "Here are the results for your query:",
-                            "query": sql_query,
-                            "data": data,
-                            "state": self.state,
-                            "db_type": self.db_type
-                        }
-                        
-            elif self.db_type == 'MongoDB':
-                mongo_q = self._generate_mongo_query(message)
-                collection_name = mongo_q.get("collection")
-                filter_q = mongo_q.get("filter", {})
-                
-                if not collection_name:
-                    return {"reply": "Could not determine collection name.", "state": self.state, "db_type": self.db_type}
-                    
-                collection = self.mongo_db[collection_name]
-                # Execute the find query and return results
-                cursor = collection.find(filter_q).limit(10)
-                data = []
-                for doc in cursor:
-                    doc['_id'] = str(doc['_id'])
-                    data.append(doc)
-                    
-                if len(data) > 0:
-                    return {
-                        "reply": f"Found {len(data)} results in collection '{collection_name}':",
-                        "query": f"db.{collection_name}.find({filter_q})",
-                        "data": data,
-                        "state": self.state,
-                        "db_type": self.db_type
-                    }
-                else:
-                    return {
-                        "reply": f"Query executed successfully on collection '{collection_name}', but returned no data.",
-                        "query": f"db.{collection_name}.find({filter_q})",
-                        "state": self.state,
-                        "db_type": self.db_type
-                    }
-                
-        except Exception as e:
+        except Exception as exc:
+            logger.warning("Connection failed: type=%s error=%s", self.db_type, type(exc).__name__)
             return {
-                "reply": f"Error executing query: {str(e)}",
+                "reply": f"Failed to connect. Error: {exc}\nPlease check your URI and try again.",
                 "state": self.state,
-                "db_type": self.db_type
             }
+
+    # ------------------------------------------------------------------
+    # Query: Semantic Cache Proxy → LangGraph (on miss)
+    # ------------------------------------------------------------------
+
+    async def _handle_query(self, message: str) -> dict:
+        if not self.genai_client:
+            return {
+                "reply": "No GEMINI_API_KEY configured. Please set it in your .env and restart.",
+                "state": self.state,
+                "db_type": self.db_type,
+            }
+
+        if self.db_type in ("PostgreSQL", "MySQL"):
+            engine = make_async_sql_engine(self.db_type, self.uri)
+            repository = SQLRepository(engine)
+        else:
+            mongo_client = make_motor_client(self.uri)
+            db_name = self.uri.split("/")[-1].split("?")[0] or "test"
+            repository = MongoRepository(mongo_client[db_name])
+
+        cache: SemanticCache | None = None
+        if self._redis and self.genai_client:
+            cache = SemanticCache(
+                redis_client=self._redis,
+                genai_client=self.genai_client,
+                session_id=self._session_id,
+                db_type=self.db_type,
+            )
+
+        try:
+            # ── Phase 1: Cache lookup ─────────────────────────────────
+            if cache:
+                cached_parsed = await cache.lookup(message)
+                if cached_parsed is not None:
+                    data = await repository.execute_query(cached_parsed)
+                    return {
+                        "reply":     "Here are the results for your query (cached):" if data
+                                     else "Query returned no results (cached).",
+                        "query":     getattr(cached_parsed, "query", str(getattr(cached_parsed, "filter", ""))),
+                        "data":      data,
+                        "state":     self.state,
+                        "db_type":   self.db_type,
+                        "cache_hit": True,
+                    }
+
+            # ── Phase 2: Full LangGraph execution (cache miss) ────────
+            graph_result = await run_query_graph_async(
+                natural_query=message,
+                db_type=self.db_type,
+                genai_client=self.genai_client,
+                model=settings.gemini_model,
+                repository=repository,
+            )
+
+            # ── Phase 3: Store on success ─────────────────────────────
+            if cache and graph_result.get("_parsed") and graph_result.get("data") is not None:
+                await cache.store(message, graph_result["_parsed"])
+
+            return {
+                "reply":   graph_result["reply"],
+                "query":   graph_result.get("query"),
+                "data":    graph_result.get("data"),
+                "state":   self.state,
+                "db_type": self.db_type,
+            }
+
+        except Exception as exc:
+            logger.error("Query handler error: %s", type(exc).__name__)
+            return {
+                "reply": f"Unexpected error: {exc}",
+                "state": self.state,
+                "db_type": self.db_type,
+            }
+        finally:
+            if self.db_type in ("PostgreSQL", "MySQL"):
+                await engine.dispose()
+            else:
+                mongo_client.close()
