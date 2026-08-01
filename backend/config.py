@@ -40,7 +40,7 @@ class Settings(BaseSettings):
         description="Gemini model ID used for structured query generation.",
     )
     gemini_embed_model: str = Field(
-        default="text-embedding-004",
+        default="gemini-embedding-2",
         description="Gemini model ID used for semantic cache embeddings.",
     )
 

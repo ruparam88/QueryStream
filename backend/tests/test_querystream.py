@@ -637,3 +637,169 @@ class TestCacheProxyIntegration:
 
         assert result["data"] == [{"id": 1}]
 
+
+# ===========================================================================
+# T11 — stream_query_events SSE generator
+# ===========================================================================
+
+class TestStreamQueryEvents:
+    """
+    Tests for streaming.stream_query_events().
+    Strategy: patch asyncio.to_thread (LLM) and mock BaseRepository,
+    collect all yielded SSE strings, parse them back to dicts, and
+    assert the event sequence is correct.
+    """
+
+    async def _collect(self, **kwargs):
+        """Run the generator and return a list of parsed event dicts."""
+        from streaming import stream_query_events
+        events = []
+        async for raw in stream_query_events(**kwargs):
+            raw = raw.strip()
+            if raw.startswith("data: "):
+                import json
+                events.append(json.loads(raw[6:]))
+        return events
+
+    def _base_kwargs(self, repo, llm_response=None):
+        from unittest.mock import MagicMock, AsyncMock, patch
+        client = MagicMock()
+        return dict(
+            natural_query="show all users",
+            db_type="PostgreSQL",
+            genai_client=client,
+            model="gemini-2.5-flash",
+            repository=repo,
+            cache=None,
+        )
+
+    # ── Happy path ────────────────────────────────────────────────────
+
+    async def test_happy_path_event_sequence(self):
+        repo = _mock_repo(rows=[{"id": 1, "name": "Alice"}])
+        kwargs = self._base_kwargs(repo)
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=_llm_response(VALID_SQL_JSON))):
+            events = await self._collect(**kwargs)
+
+        event_names = [e["event"] for e in events]
+        assert "query"     in event_names
+        assert "executing" in event_names
+        assert "result"    in event_names
+        assert events[-1]["event"] == "done"
+
+    async def test_result_event_contains_data(self):
+        rows = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+        repo = _mock_repo(rows=rows)
+        kwargs = self._base_kwargs(repo)
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=_llm_response(VALID_SQL_JSON))):
+            events = await self._collect(**kwargs)
+
+        result_evt = next(e for e in events if e["event"] == "result")
+        assert result_evt["data"] == rows
+        assert result_evt["query"] == "SELECT * FROM users LIMIT 10"
+
+    # ── Retry path ────────────────────────────────────────────────────
+
+    async def test_retry_emits_error_then_healing_then_result(self):
+        repo = _mock_repo()
+        repo.execute_query = AsyncMock(side_effect=[
+            Exception("column 'usrs' does not exist"),
+            [{"id": 1}],
+        ])
+        kwargs = self._base_kwargs(repo)
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=_llm_response(REPAIRED_SQL_JSON))):
+            events = await self._collect(**kwargs)
+
+        event_names = [e["event"] for e in events]
+        assert "error"   in event_names
+        assert "healing" in event_names
+        assert "result"  in event_names
+        # error must come before result
+        assert event_names.index("error") < event_names.index("result")
+
+    async def test_escalated_after_max_attempts(self):
+        from graph import MAX_ATTEMPTS
+        repo = _mock_repo(raises=Exception("DB always fails"))
+        kwargs = self._base_kwargs(repo)
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=_llm_response(VALID_SQL_JSON))):
+            events = await self._collect(**kwargs)
+
+        event_names = [e["event"] for e in events]
+        assert "escalated" in event_names
+        assert events[-1]["event"] == "done"
+        esc = next(e for e in events if e["event"] == "escalated")
+        assert str(MAX_ATTEMPTS) in esc["reply"]
+
+    # ── Destructive guard ─────────────────────────────────────────────
+
+    async def test_destructive_op_emits_escalated_no_execute(self):
+        repo = _mock_repo()
+        kwargs = self._base_kwargs(repo)
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=_llm_response(DESTRUCTIVE_SQL_JSON))):
+            events = await self._collect(**kwargs)
+
+        event_names = [e["event"] for e in events]
+        assert "escalated" in event_names
+        assert "result"    not in event_names
+        repo.execute_query.assert_not_awaited()
+
+    # ── Cache hit ─────────────────────────────────────────────────────
+
+    async def test_cache_hit_skips_graph(self):
+        from schemas import SQLQueryResponse
+        from unittest.mock import MagicMock, AsyncMock
+
+        repo  = _mock_repo(rows=[{"id": 1}])
+        cache = MagicMock()
+        cached_parsed = SQLQueryResponse.model_validate_json(VALID_SQL_JSON)
+        cache.lookup = AsyncMock(return_value=cached_parsed)
+        cache.store  = AsyncMock()
+
+        kwargs = self._base_kwargs(repo)
+        kwargs["cache"] = cache
+
+        with patch("asyncio.to_thread") as mock_thread:
+            events = await self._collect(**kwargs)
+
+        event_names = [e["event"] for e in events]
+        assert "cache_hit" in event_names
+        assert "result"    in event_names
+        assert "query"     not in event_names   # graph never ran
+        mock_thread.assert_not_called()          # LLM never called
+        cache.store.assert_not_awaited()         # no re-store on HIT
+
+    async def test_cache_miss_stores_on_success(self):
+        from unittest.mock import MagicMock, AsyncMock
+
+        repo  = _mock_repo(rows=[{"id": 1}])
+        cache = MagicMock()
+        cache.lookup = AsyncMock(return_value=None)   # MISS
+        cache.store  = AsyncMock()
+
+        kwargs = self._base_kwargs(repo)
+        kwargs["cache"] = cache
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=_llm_response(VALID_SQL_JSON))):
+            events = await self._collect(**kwargs)
+
+        event_names = [e["event"] for e in events]
+        assert "result" in event_names
+        cache.store.assert_awaited_once()   # result stored in cache
+
+    # ── done always last ──────────────────────────────────────────────
+
+    async def test_done_is_always_last_event(self):
+        """Even on exception, 'done' must be the final event."""
+        repo = _mock_repo(raises=Exception("fatal"))
+        kwargs = self._base_kwargs(repo)
+
+        with patch("asyncio.to_thread", new=AsyncMock(return_value=_llm_response(VALID_SQL_JSON))):
+            events = await self._collect(**kwargs)
+
+        assert events[-1]["event"] == "done"
+

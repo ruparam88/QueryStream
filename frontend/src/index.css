@@ -312,3 +312,104 @@ body {
 .query-accordion[open] summary {
   margin-bottom: 0.5rem;
 }
+
+/* ── SSE Stream Steps ─────────────────────────────────────────────────── */
+.stream-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+  padding: 0.6rem 0.75rem;
+  background: rgba(15, 23, 42, 0.5);
+  border-radius: 0.5rem;
+  border-left: 2px solid var(--accent-primary);
+  font-size: 0.8rem;
+}
+
+.stream-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.4rem;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.stream-step--query      { color: #60a5fa; }
+.stream-step--result     { color: #34d399; }
+.stream-step--cache_hit  { color: #f59e0b; }
+.stream-step--error      { color: #f87171; }
+.stream-step--escalated  { color: #f87171; }
+.stream-step--healing    { color: #a78bfa; }
+
+.stream-step__query {
+  display: block;
+  margin-top: 0.2rem;
+  padding: 0.25rem 0.5rem;
+  background: rgba(0,0,0,0.4);
+  border-radius: 0.25rem;
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: #a5d6ff;
+  word-break: break-all;
+  white-space: pre-wrap;
+}
+
+.stream-step__error {
+  display: block;
+  margin-top: 0.2rem;
+  padding: 0.25rem 0.5rem;
+  background: rgba(239, 68, 68, 0.1);
+  border-radius: 0.25rem;
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: #fca5a5;
+  word-break: break-all;
+}
+
+/* ── Cache hit badge ─────────────────────────────────────────────────── */
+.cache-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.3);
+  border-radius: 2rem;
+  padding: 0.2rem 0.6rem;
+  margin-bottom: 0.5rem;
+  letter-spacing: 0.03em;
+}
+
+/* ── Sidebar badges ──────────────────────────────────────────────────── */
+.sidebar-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  margin-top: 1.25rem;
+}
+
+.sidebar-badge {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  background: rgba(255,255,255,0.04);
+  border: 1px solid var(--border-color);
+  border-radius: 0.4rem;
+  padding: 0.35rem 0.6rem;
+}
+
+/* ── Spin animation (Loader icon while streaming) ────────────────────── */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+  display: inline-block;
+  flex-shrink: 0;
+}
