@@ -55,3 +55,4 @@ ENV/
 #Manual files
 *.txt
 History_claude_1.md
+*.pdf
