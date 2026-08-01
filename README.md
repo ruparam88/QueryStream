@@ -35,6 +35,20 @@ Unlike basic LLM wrappers that blindly guess schema structures, QueryStream util
 
 ---
 
+## 📸 Outputs / Screenshots
+
+Here is a glimpse of QueryStream in action:
+
+<div align="center">
+  <img src="Outputs/screenshot-1.png" width="45%" alt="QueryStream Screenshot 1" />
+  <img src="Outputs/screenshot-2.png" width="45%" alt="QueryStream Screenshot 2" />
+  <br />
+  <img src="Outputs/screenshot-3.png" width="45%" alt="QueryStream Screenshot 3" />
+  <img src="Outputs/screenshot-4.png" width="45%" alt="QueryStream Screenshot 4" />
+</div>
+
+---
+
 ## ✨ Key Features
 
 - 🧠 **Dynamic Schema RAG**: Automatically introspects your live database schema (DDL and Foreign Keys) and injects it into the LLM context to prevent hallucinations and achieve high execution accuracy.
