@@ -46,6 +46,7 @@ class QueryState(TypedDict):
     repository: Any                  # BaseRepository — async DB accessor
     genai_client: Any                # google.genai.Client (sync SDK)
     model: str                       # e.g. "gemini-2.5-flash"
+    schema_context: str              # string representation of DB schema
 
     # Mutable workflow state
     attempt: int
@@ -72,19 +73,47 @@ async def node_generate(state: QueryState) -> QueryState:
     last_error = state.get("last_error", "")
     last_query = state.get("last_query", "")
 
+    schema_context = state.get("schema_context", "")
+    _SYSTEM_TABLE_GUARD = (
+        "NEVER query information_schema, sys, performance_schema, or pg_catalog system tables. "
+        "Use ONLY user tables."
+    )
+    if schema_context:
+        schema_section = (
+            f"\n\nAvailable Database Schema (DDL-style, one column per line):\n"
+            f"{'=' * 60}\n"
+            f"{schema_context}\n"
+            f"{'=' * 60}\n"
+            f"\nSTRICT COLUMN RULES — violating any of these is an error:\n"
+            f"  1. ONLY use column names that are explicitly listed above.\n"
+            f"     NEVER invent, assume, or guess column names (e.g. do NOT\n"
+            f"     use 'id', 'created_at', 'name', etc. unless they appear\n"
+            f"     in the schema above for that specific table).\n"
+            f"  2. For JOIN conditions: if a 'Foreign Keys' section appears\n"
+            f"     above, use EXACTLY those column pairs. If no FK is listed,\n"
+            f"     inspect the column lists of BOTH tables, find columns that\n"
+            f"     share a name or a clear semantic link, and use those.\n"
+            f"     If no safe join column can be identified from the schema,\n"
+            f"     state that in the query field and set confidence_score low.\n"
+            f"  3. {_SYSTEM_TABLE_GUARD}"
+        )
+    else:
+        schema_section = f"\n\nCRITICAL: {_SYSTEM_TABLE_GUARD}"
+
+
     if attempt == 0 or not last_error:
         prompt = (
-            f"You are an expert {db_type} query writer.\n"
+            f"You are an expert {db_type} query writer.{schema_section}\n\n"
             f"Translate the following user request into a query.\n\n"
             f"User request: {natural_query}"
         )
     else:
         prompt = (
-            f"You are an expert {db_type} query writer performing self-healing repair.\n\n"
+            f"You are an expert {db_type} query writer performing self-healing repair.{schema_section}\n\n"
             f"Original user intent:\n{natural_query}\n\n"
             f"Previously attempted query (attempt {attempt}):\n{last_query}\n\n"
             f"Database error returned:\n{last_error}\n\n"
-            f"Analyse the error, correct the query, and return a fixed version."
+            f"Analyse the error against the schema, correct the query, and return a fixed version."
         )
 
     logger.info("GENERATING: db=%s attempt=%d", db_type, attempt + 1)
@@ -264,12 +293,15 @@ async def run_query_graph_async(
     Async entry point. Called by agent.py.
     Returns a dict compatible with the existing ChatResponse contract.
     """
+    schema_context = await repository.get_schema_context()
+
     initial: QueryState = {
         "natural_query": natural_query,
         "db_type": db_type,
         "repository": repository,
         "genai_client": genai_client,
         "model": model,
+        "schema_context": schema_context,
         "attempt": 0,
         "last_query": "",
         "last_error": "",

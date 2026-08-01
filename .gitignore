@@ -51,3 +51,7 @@ ENV/
 *.log
 *.sqlite
 *.db
+
+#Manual files
+*.txt
+History_claude_1.md

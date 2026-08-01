@@ -86,6 +86,7 @@ def _mock_repo(rows=None, raises=None) -> MagicMock:
     else:
         repo.execute_query = AsyncMock(return_value=rows or [{"id": 1, "name": "Alice"}])
     repo.ping = AsyncMock()
+    repo.get_schema_context = AsyncMock(return_value="Table: users (columns: id [int], name [varchar])")
     return repo
 
 
@@ -97,6 +98,7 @@ def _base_initial(db_type="PostgreSQL", repo=None, client=None) -> dict:
         "repository": repo or _mock_repo(),
         "genai_client": client or MagicMock(),
         "model": "gemini-2.5-flash",
+        "schema_context": "Table: users (columns: id [int], name [varchar])",
         "attempt": 0,
         "last_query": "",
         "last_error": "",
@@ -683,10 +685,13 @@ class TestStreamQueryEvents:
             events = await self._collect(**kwargs)
 
         event_names = [e["event"] for e in events]
+        assert "thinking"  in event_names          # NEW: LLM generation started signal
         assert "query"     in event_names
         assert "executing" in event_names
         assert "result"    in event_names
         assert events[-1]["event"] == "done"
+        # thinking must appear before query
+        assert event_names.index("thinking") < event_names.index("query")
 
     async def test_result_event_contains_data(self):
         rows = [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]

@@ -66,7 +66,48 @@ class ChatManager:
     # Public entry point
     # ------------------------------------------------------------------
 
-    async def process_message(self, message: str) -> dict:
+    # DB-type keywords that should never be forwarded to the LLM as a query.
+    _DB_TYPE_KEYWORDS: frozenset = frozenset(
+        {"postgresql", "mysql", "mongodb", "postgres", "mongo"}
+    )
+
+    async def process_message(self, message: str, is_option: bool = False) -> dict:
+        msg_clean = message.strip().lower()
+
+        # /reset is always handled regardless of state
+        if msg_clean == "/reset":
+            logger.info("Explicit /reset: clearing session.")
+            self.state = "AWAITING_DB_TYPE"
+            self.db_type = None
+            self.hosting_type = None
+            self.uri = None
+            return {
+                "reply": "Session reset. What type of database would you like to connect to?",
+                "options": ["PostgreSQL", "MySQL", "MongoDB"],
+                "state": self.state,
+            }
+
+        # A DB-type keyword from any non-AWAITING_DB_TYPE state means the user
+        # wants to switch databases — reset and route to _handle_db_type.
+        if msg_clean in self._DB_TYPE_KEYWORDS and self.state != "AWAITING_DB_TYPE":
+            logger.info(
+                "DB-type keyword '%s' received in state %s — resetting session.",
+                message, self.state,
+            )
+            self.state = "AWAITING_DB_TYPE"
+            self.db_type = None
+            self.hosting_type = None
+            self.uri = None
+            return await self._handle_db_type(message)
+
+        # Intelligent re-selection of hosting type
+        if msg_clean in ("local", "cloud") and self.db_type and (is_option or self.state not in ("AWAITING_HOSTING_TYPE", "AWAITING_URI")):
+            logger.info("Re-selecting hosting type (%s) for db_type=%s", message, self.db_type)
+            self.state = "AWAITING_HOSTING_TYPE"
+            self.hosting_type = None
+            self.uri = None
+            return await self._handle_hosting_type(message)
+
         dispatch = {
             "AWAITING_DB_TYPE":      self._handle_db_type,
             "AWAITING_HOSTING_TYPE": self._handle_hosting_type,
@@ -91,7 +132,7 @@ class ChatManager:
         msg = message.lower().strip()
         if "postgres" in msg:
             self.db_type = "PostgreSQL"
-        elif "mysql" in msg or "sql" in msg:
+        elif "mysql" in msg:
             self.db_type = "MySQL"
         elif "mongo" in msg:
             self.db_type = "MongoDB"
@@ -175,6 +216,21 @@ class ChatManager:
     # ------------------------------------------------------------------
 
     async def _handle_query(self, message: str) -> dict:
+        msg_clean = message.strip().lower()
+
+        # Safety net: if a db-type keyword somehow reaches here, never send it
+        # to the LLM. Instead prompt the user to ask a real database question.
+        if msg_clean in self._DB_TYPE_KEYWORDS:
+            return {
+                "reply": (
+                    f"You are already connected to a {self.db_type} database. "
+                    f"Please ask a question about your data, e.g. \"Show all tables\" "
+                    f"or \"Count rows in orders\"."
+                ),
+                "state": self.state,
+                "db_type": self.db_type,
+            }
+
         if not self.genai_client:
             return {
                 "reply": "No GEMINI_API_KEY configured. Please set it in your .env and restart.",
@@ -202,7 +258,18 @@ class ChatManager:
         try:
             # ── Phase 1: Cache lookup ─────────────────────────────────
             if cache:
-                cached_parsed = await cache.lookup(message)
+                # Fetch schema to extract live table names for the staleness
+                # guard — skips cached entries for tables that no longer exist.
+                schema_ctx = await repository.get_schema_context()
+                live_table_names: set[str] = set()
+                for line in schema_ctx.splitlines():
+                    for prefix in ("Table: ", "Collection: "):
+                        if line.startswith(prefix):
+                            tname = line[len(prefix):].split(" (")[0].strip()
+                            if tname:
+                                live_table_names.add(tname)
+
+                cached_parsed = await cache.lookup(message, live_table_names or None)
                 if cached_parsed is not None:
                     data = await repository.execute_query(cached_parsed)
                     return {
@@ -214,6 +281,8 @@ class ChatManager:
                         "db_type":   self.db_type,
                         "cache_hit": True,
                     }
+            else:
+                schema_ctx = None
 
             # ── Phase 2: Full LangGraph execution (cache miss) ────────
             graph_result = await run_query_graph_async(

@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 def _sse(payload: dict) -> str:
     """Format a dict as a single SSE data line."""
-    return f"data: {json.dumps(payload)}\n\n"
+    return f"data: {json.dumps(payload, default=str)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,25 @@ async def stream_query_events(
     try:
         # ── Phase 1: Semantic cache lookup ───────────────────────────
         if cache:
-            cached_parsed = await cache.lookup(natural_query)
+            # Fetch schema now so we can pass live table names to the
+            # cache lookup. This lets the staleness guard skip any cached
+            # entry that references a table not in the current schema,
+            # automatically invalidating stale results after migrations.
+            schema_context = await repository.get_schema_context()
+
+            # Extract live table names from the schema context string.
+            # Format: "Table: <name> (columns: ...)"  or
+            #         "Collection: <name> (fields: ...)"
+            live_table_names: set[str] = set()
+            for line in schema_context.splitlines():
+                for prefix in ("Table: ", "Collection: "):
+                    if line.startswith(prefix):
+                        rest = line[len(prefix):]
+                        table_name = rest.split(" (")[0].strip()
+                        if table_name:
+                            live_table_names.add(table_name)
+
+            cached_parsed = await cache.lookup(natural_query, live_table_names or None)
             if cached_parsed is not None:
                 query_str = getattr(cached_parsed, "query",
                                     str(getattr(cached_parsed, "filter", "")))
@@ -86,17 +104,23 @@ async def stream_query_events(
                 yield _sse({"event": "result", "reply": reply, "data": data, "query": query_str})
                 yield _sse({"event": "done"})
                 return
+        else:
+            schema_context = None  # will be fetched below
 
         # ── Phase 2: LangGraph execution — stream node-by-node ───────
         from config import settings
 
+        if schema_context is None:
+            schema_context = await repository.get_schema_context()
+
         initial = {
-            "natural_query": natural_query,
-            "db_type":       db_type,
-            "repository":    repository,
-            "genai_client":  genai_client,
-            "model":         model,
-            "attempt":       0,
+            "natural_query":  natural_query,
+            "db_type":          db_type,
+            "repository":     repository,
+            "genai_client":   genai_client,
+            "model":          model,
+            "schema_context": schema_context,
+            "attempt":        0,
             "last_query":    "",
             "last_error":    "",
             "result_data":   None,
@@ -106,6 +130,10 @@ async def stream_query_events(
         }
 
         final_state = None
+
+        # Signal to the frontend that LLM generation has started (attempt 1).
+        # This activates the "thinking" spinner that was previously dead code.
+        yield _sse({"event": "thinking", "attempt": 1})
 
         async for chunk in execution_graph.astream(initial):
             node_name  = next(iter(chunk))          # e.g. "GENERATING"

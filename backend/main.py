@@ -108,7 +108,7 @@ async def chat_endpoint(
     )
 
     try:
-        response = await manager.process_message(request.message)
+        response = await manager.process_message(request.message, is_option=bool(request.is_option))
         await session_manager.save(request.session_id, manager.to_dict())
         return ChatResponse(**response)
     except Exception as exc:
@@ -147,11 +147,21 @@ async def chat_stream_endpoint(
             session_id=request.session_id,
         )
 
-        # Non-CONNECTED states: single event — no graph streaming needed
-        if manager.state != "CONNECTED":
-            response = await manager.process_message(request.message)
+        msg_clean = request.message.strip().lower()
+        _db_type_keywords = {"postgresql", "mysql", "mongodb", "postgres", "mongo"}
+        # Route to setup flow if: explicit /reset, OR a db-type keyword typed while
+        # already past AWAITING_DB_TYPE, OR is_option flag set by the frontend.
+        is_reset_or_option = (
+            msg_clean == "/reset"
+            or request.is_option
+            or (msg_clean in _db_type_keywords and manager.state != "AWAITING_DB_TYPE")
+        )
+
+        # Non-CONNECTED states or intelligent option/reset interventions
+        if manager.state != "CONNECTED" or is_reset_or_option:
+            response = await manager.process_message(request.message, is_option=bool(request.is_option))
             await session_manager.save(request.session_id, manager.to_dict())
-            yield f"data: {json.dumps({'event': 'message', **response})}\n\n"
+            yield f"data: {json.dumps({'event': 'message', **response}, default=str)}\n\n"
             yield f"data: {json.dumps({'event': 'done'})}\n\n"
             return
 
@@ -226,6 +236,75 @@ async def health(
         "cache_threshold": settings.sem_cache_threshold,
         "max_attempts": settings.max_query_attempts,
         "version":      "5.0.0",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cache management endpoints
+# ---------------------------------------------------------------------------
+
+@app.delete("/cache/{session_id}")
+async def clear_semantic_cache(
+    session_id: str,
+    db_type: str = "MySQL",
+    session_manager: RedisSessionManager = Depends(get_session_manager),
+) -> dict:
+    """
+    Flush the semantic query cache for a specific session + db_type pair.
+
+    Use this to force LLM regeneration after a bad/stale result was cached.
+    The next identical query will go through the LLM and a fresh entry will
+    be stored.
+
+    Query params:
+        db_type: "PostgreSQL" | "MySQL" | "MongoDB"  (default: MySQL)
+    """
+    cache = SemanticCache(
+        redis_client=session_manager._client,
+        genai_client=None,      # not needed for clear() — only _embed() uses it
+        session_id=session_id,
+        db_type=db_type,
+    )
+    count = await cache.clear()
+    logger.info(
+        "Cache cleared via API: session=%s db_type=%s entries=%d",
+        session_id, db_type, count,
+    )
+    return {
+        "cleared":         True,
+        "session_id":      session_id,
+        "db_type":         db_type,
+        "entries_removed": count,
+    }
+
+
+@app.get("/cache/{session_id}")
+async def inspect_semantic_cache(
+    session_id: str,
+    db_type: str = "MySQL",
+    session_manager: RedisSessionManager = Depends(get_session_manager),
+) -> dict:
+    """
+    Inspect all entries in the semantic cache for a session + db_type pair.
+
+    Returns the natural-language query, generated SQL, confidence score, and
+    whether the entry is "poisoned" (references system catalog tables).
+
+    Query params:
+        db_type: "PostgreSQL" | "MySQL" | "MongoDB"  (default: MySQL)
+    """
+    cache = SemanticCache(
+        redis_client=session_manager._client,
+        genai_client=None,
+        session_id=session_id,
+        db_type=db_type,
+    )
+    entries = await cache.get_all_entries()
+    return {
+        "session_id": session_id,
+        "db_type":    db_type,
+        "count":      len(entries),
+        "entries":    entries,
     }
 
 
