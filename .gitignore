@@ -24,8 +24,7 @@ dist/
 build/
 
 # Python
-backend\__pycache__
-__pycache__/
+backend/__pycache__
 *.pyc
 *.py[cod]
 *$py.class
