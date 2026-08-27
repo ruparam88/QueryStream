@@ -17,13 +17,19 @@
 
 - [About the Project](#-about-the-project)
 - [Key Features](#-key-features)
-- [Getting Started](#-getting-started)
+- [🐳 Running with Docker (Recommended)](#-running-with-docker-recommended)
+  - [1. Configure Environment](#1-configure-environment)
+  - [2. Start QueryStream Stack](#2-start-querystream-stack)
+  - [3. Spin Up a Database Container](#3-spin-up-a-database-container)
+  - [4. Connect Database to QueryStream Network](#4-connect-database-to-querystream-network)
+  - [5. Connect & Query via Web Interface](#5-connect--query-via-web-interface)
+- [🛠️ Local Manual Setup](#️-local-manual-setup)
   - [Prerequisites](#prerequisites)
   - [Installation](#installation)
   - [Environment Variables](#environment-variables)
-- [Usage](#-usage)
-- [Roadmap & Contributing](#-roadmap--contributing)
-- [License & Acknowledgments](#-license--acknowledgments)
+- [💡 Usage](#-usage)
+- [🗺️ Roadmap & Contributing](#-roadmap--contributing)
+- [📄 License & Acknowledgments](#-license--acknowledgments)
 
 ---
 
@@ -59,7 +65,112 @@ Here is a glimpse of QueryStream in action:
 
 ---
 
-## 🛠️ Getting Started
+## 🐳 Running with Docker (Recommended)
+
+Run the entire QueryStream stack (Frontend, Backend, and Redis) with a single command using Docker Compose.
+
+### 1. Configure Environment
+
+Create a `.env` file in the root directory and add your Google Gemini API key:
+
+```env
+GEMINI_API_KEY="your-google-gemini-api-key"
+```
+
+*(On Windows PowerShell, you can also set it directly for the session: `$env:GEMINI_API_KEY="your-google-gemini-api-key"`)*
+
+### 2. Start QueryStream Stack
+
+Build and start all services:
+
+```bash
+docker compose up --build
+```
+
+- **Frontend**: [http://localhost:3000](http://localhost:3000)
+- **Backend API & Swagger Docs**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **Redis Cache**: `localhost:6379`
+
+---
+
+### 3. Spin Up a Database Container
+
+If you don't already have a database running, you can create one easily in Docker:
+
+#### Option A: PostgreSQL Container
+```bash
+docker run -d --name my-postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_PASSWORD=pass123 \
+  -e POSTGRES_DB=employees \
+  -p 5432:5432 \
+  postgres:16-alpine
+```
+
+#### Option B: MySQL Container
+```bash
+docker run -d --name my-mysql \
+  -e MYSQL_ROOT_PASSWORD=pass123 \
+  -e MYSQL_DATABASE=employees \
+  -p 3306:3306 \
+  mysql:8.0
+```
+
+#### Option C: MongoDB Container
+```bash
+docker run -d --name my-mongo \
+  -e MONGO_INITDB_ROOT_USERNAME=admin \
+  -e MONGO_INITDB_ROOT_PASSWORD=pass123 \
+  -p 27017:27017 \
+  mongo:7.0
+```
+
+---
+
+### 4. Connect Database to QueryStream Network
+
+To allow the QueryStream backend container to communicate directly with your database container by name, connect your database to QueryStream's Docker network:
+
+1. **Check the network name:**
+   ```bash
+   docker network ls
+   ```
+   *(Usually named `querystream_querystream-net`)*
+
+2. **Attach your container to the network:**
+   ```bash
+   # For PostgreSQL:
+   docker network connect querystream_querystream-net my-postgres
+
+   # For MySQL:
+   docker network connect querystream_querystream-net my-mysql
+
+   # For MongoDB:
+   docker network connect querystream_querystream-net my-mongo
+   ```
+
+---
+
+### 5. Connect & Query via Web Interface
+
+1. Open your browser and navigate to **[http://localhost:3000](http://localhost:3000)**.
+2. Select your database type and enter the connection string using your container name:
+
+| Database | Connection String Format |
+| :--- | :--- |
+| **PostgreSQL** | `postgresql://postgres:pass123@my-postgres:5432/employees` |
+| **MySQL** | `mysql://root:pass123@my-mysql:3306/employees` |
+| **MongoDB** | `mongodb://admin:pass123@my-mongo:27017` |
+
+*(Note: If connecting to a database running natively on your host machine outside Docker, use `host.docker.internal` instead of the container name).*
+
+3. Once connected, start asking queries in plain English!
+
+---
+
+## 🛠️ Local Manual Setup
+
+If you prefer to run the services manually without Docker:
 
 ### Prerequisites
 
@@ -111,7 +222,7 @@ SEM_CACHE_THRESHOLD=0.95
 
 ---
 
-## 💡 Usage
+## 💡 Usage (Manual Mode)
 
 1. **Start the Redis Server** (if running locally):
    ```bash
@@ -145,7 +256,7 @@ SEM_CACHE_THRESHOLD=0.95
 ### Future Plans
 - [ ] Add support for Snowflake and BigQuery.
 - [ ] Incorporate comprehensive observability (LangSmith/Phoenix).
-- [ ] Provide Docker Compose support for a 1-click full-stack deployment.
+- [x] Provide Docker Compose support for a 1-click full-stack deployment.
 
 ### Contributing
 Contributions are what make the open source community such an amazing place to learn, inspire, and create. Any contributions you make are **greatly appreciated**.
